@@ -1,0 +1,8 @@
+/target/
+/games/
+*.exe
+
+# Created by the program next to the exe — settings.json holds your Discord token!
+settings.json
+played.json
+detectable.json
