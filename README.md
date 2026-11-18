@@ -1,4 +1,4 @@
-# discordunlocker
+# azovunlocker
 
 Windows-програма на Rust (eframe), яка запускає «фіктивні» ігри, щоб Discord бачив їх як запущені, і автоматично виконує квести Discord (відео та ігрові).
 
