@@ -1,5 +1,5 @@
 #![windows_subsystem = "windows"]
-//! Discord Unlocker — makes Discord detect games so that unique games,
+//! Discord Unlocker ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes Discord detect games so that unique games,
 //! game hours and demo hours are counted.
 //!
 //! Discord detects games by the exe path of a process. For each game we create a
@@ -7,12 +7,16 @@
 //! with an env var; that copy just sleeps (0% CPU, ~150 KB RAM, no window).
 
 mod bg;
+mod farm;
 mod games;
 mod http;
 mod logo;
 mod manager;
 mod quests;
+mod rpc;
+mod stream;
 mod ui;
+mod web;
 
 pub const DUMMY_ENV: &str = "DU_DUMMY";
 pub const TITLE_ENV: &str = "DU_TITLE";
@@ -67,6 +71,9 @@ fn main() -> eframe::Result {
     if std::env::var_os(DUMMY_ENV).is_some() {
         dummy();
     }
+    if std::env::var_os(web::ROLE_ENV).is_some() {
+        web::host();
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("azovunlocker")
@@ -78,7 +85,7 @@ fn main() -> eframe::Result {
                 width: logo::ICON_SIZE,
                 height: logo::ICON_SIZE,
             })),
-        vsync: true,
+        vsync: false,
         multisampling: 0,
         depth_buffer: 0,
         stencil_buffer: 0,

@@ -2,7 +2,10 @@
 /games/
 *.exe
 
-# Created by the program next to the exe — settings.json holds your Discord token!
+# Created by the program next to the exe.
+# settings.json holds your Discord tokens, web/ holds the logged-in browser sessions!
 settings.json
+/web/
 played.json
-detectable.json
+stream.json
+detectable*.json

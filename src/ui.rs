@@ -1,8 +1,10 @@
 use crate::bg::Background;
+use crate::farm::{self, FarmConfig, FarmState};
 use crate::games::{self, Game};
 use crate::logo;
 use crate::manager::{self, Manager, QuestTask, TaskState};
 use crate::quests::{self, DiscoveredQuest, QuestOverview};
+use crate::stream::{self, StreamCtl};
 use eframe::egui::{
     self, epaint::RectShape, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, FontFamily,
     FontId, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, TextStyle, TextureHandle,
@@ -26,7 +28,7 @@ const ACCENT_DEEP: Color32 = Color32::from_rgb(88, 94, 204);
 const HOT: Color32 = Color32::from_rgb(160, 112, 222);
 /// Lavender glint — the gleam running over the logo text.
 const GLINT: Color32 = Color32::from_rgb(211, 214, 246);
-const TAB_PAD: f32 = 32.0;
+const TAB_PAD: f32 = 26.0;
 const TAB_GAP: f32 = 4.0;
 
 const GREEN: Color32 = Color32::from_rgb(94, 242, 181);
@@ -63,7 +65,7 @@ struct Settings {
     scale: f32,
     pause_unfocused: bool,
     mouse_glow: bool,
-    play_minutes: u32,
+    play_time: TimeSetting,
     discord_token: String,
     quest_do_desktop: bool,
     quest_do_mobile: bool,
@@ -74,6 +76,14 @@ struct Settings {
     quest_filter_orbs: bool,
     quest_filter_cosmetics: bool,
     quest_filter_ingame: bool,
+    farm_target: usize,
+    farm_batch: usize,
+    farm_time: TimeSetting,
+    farm_only_demo: bool,
+    farm_skip_adult: bool,
+    stream_time: TimeSetting,
+    /// Token of the second account, which streams to the main one.
+    stream_token: String,
 }
 
 impl Default for Settings {
@@ -84,7 +94,7 @@ impl Default for Settings {
             scale: 0.5,
             pause_unfocused: true,
             mouse_glow: true,
-            play_minutes: 0,
+            play_time: TimeSetting::new(30, TimeUnit::Forever),
             discord_token: String::new(),
             quest_do_desktop: true,
             quest_do_mobile: true,
@@ -95,6 +105,13 @@ impl Default for Settings {
             quest_filter_orbs: true,
             quest_filter_cosmetics: true,
             quest_filter_ingame: true,
+            farm_target: 50,
+            farm_batch: 10,
+            farm_time: TimeSetting::new(15, TimeUnit::Sec),
+            farm_only_demo: false,
+            farm_skip_adult: true,
+            stream_time: TimeSetting::new(1, TimeUnit::Hour),
+            stream_token: String::new(),
         }
     }
 }
@@ -102,6 +119,7 @@ impl Default for Settings {
 #[derive(PartialEq, Clone, Copy)]
 enum Page {
     Games,
+    Unique,
     Quests,
     Active,
     Settings,
@@ -137,6 +155,8 @@ pub struct App {
     cancel_quests: Arc<AtomicBool>,
     /// True while a quest queue is being executed (set by `quests::run_all_quests`).
     quests_running: Arc<AtomicBool>,
+    farm: Arc<FarmState>,
+    stream: StreamCtl,
     loading_quests: Option<mpsc::Receiver<Result<QuestOverview, String>>>,
     /// Account-level restriction reported by Discord (enrollment blocked etc.).
     quests_notice: Option<String>,
@@ -152,6 +172,8 @@ pub struct App {
     saved_settings: String,
     last_settings_check: Instant,
     shot: Option<Shot>,
+    /// The working set was already trimmed for the current minimize.
+    trimmed: bool,
 }
 
 /// Ready-made content of the Quests tab, so the list isn't filtered and formatted
@@ -214,6 +236,7 @@ impl Shot {
         let path = std::env::var("DU_SHOT").ok()?;
         let page = match std::env::var("DU_PAGE").as_deref() {
             Ok("quests") => Some(Page::Quests),
+            Ok("unique") => Some(Page::Unique),
             Ok("active") => Some(Page::Active),
             Ok("settings") => Some(Page::Settings),
             _ => None,
@@ -576,15 +599,105 @@ fn fmt_clock(s: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-fn minutes_picker(ui: &mut egui::Ui, v: &mut u32) {
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+enum TimeUnit {
+    Sec,
+    Min,
+    Hour,
+    /// No time limit (only where it makes sense).
+    Forever,
+}
+
+impl TimeUnit {
+    fn secs(self) -> u64 {
+        match self {
+            TimeUnit::Sec => 1,
+            TimeUnit::Min => 60,
+            TimeUnit::Hour => 3600,
+            TimeUnit::Forever => 0,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TimeUnit::Sec => "секунд",
+            TimeUnit::Min => "хвилин",
+            TimeUnit::Hour => "годин",
+            TimeUnit::Forever => "∞ без обмеження",
+        }
+    }
+}
+
+/// An amount of time as the user typed it: a number and a unit.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+struct TimeSetting {
+    amount: u64,
+    unit: TimeUnit,
+}
+
+impl TimeSetting {
+    const fn new(amount: u64, unit: TimeUnit) -> Self {
+        Self { amount, unit }
+    }
+
+    /// None = without a limit.
+    fn secs(self) -> Option<u64> {
+        (self.unit != TimeUnit::Forever).then(|| self.amount * self.unit.secs())
+    }
+}
+
+/// Shortest hold of a farm game.
+const FARM_MIN_SECS: u64 = 5;
+/// Upper limit for any typed time: 1000 hours.
+const MAX_TIME_SECS: u64 = 1000 * 3600;
+
+/// Time input: a number field plus a unit list. With `forever`, the list also offers
+/// "no limit", and the number field is hidden while it is chosen. `min_secs` is the
+/// smallest accepted time.
+fn time_input(ui: &mut egui::Ui, salt: &str, v: &mut TimeSetting, forever: bool, min_secs: u64) {
     ui.horizontal(|ui| {
-        for (m, label) in [(30, "30 хв"), (60, "1 год"), (120, "2 год"), (300, "5 год"), (0, "∞")] {
-            if ui.selectable_label(*v == m, label).clicked() {
-                *v = m;
+        if v.unit != TimeUnit::Forever {
+            // The text is kept while typing, so the field can be cleared and retyped;
+            // the value itself is updated on every valid change.
+            let id = ui.id().with(("time", salt));
+            let buf_id = id.with("buf");
+            let mut buf = ui.data_mut(|d| d.get_temp::<String>(buf_id)).unwrap_or_else(|| v.amount.to_string());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .id(id)
+                    .desired_width(64.0)
+                    .char_limit(7)
+                    .horizontal_align(Align::Center)
+                    .margin(Margin::symmetric(8, 6)),
+            );
+            if r.changed() {
+                buf.retain(|c| c.is_ascii_digit());
+                if let Ok(n) = buf.parse::<u64>() {
+                    v.amount = n;
+                }
+            }
+            if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(buf_id, buf));
+            } else {
+                ui.data_mut(|d| d.remove::<String>(buf_id));
             }
         }
-        ui.add(egui::DragValue::new(v).range(0..=6000).suffix(" хв"));
+        let units: &[TimeUnit] = if forever {
+            &[TimeUnit::Sec, TimeUnit::Min, TimeUnit::Hour, TimeUnit::Forever]
+        } else {
+            &[TimeUnit::Sec, TimeUnit::Min, TimeUnit::Hour]
+        };
+        egui::ComboBox::from_id_salt(("unit", salt)).selected_text(v.unit.label()).show_ui(ui, |ui| {
+            for &u in units {
+                ui.selectable_value(&mut v.unit, u, u.label());
+            }
+        });
     });
+    // Keep the value valid without fighting the user while they type.
+    if v.unit != TimeUnit::Forever {
+        let unit = v.unit.secs();
+        v.amount = v.amount.clamp(min_secs.div_ceil(unit).max(1), MAX_TIME_SECS / unit);
+    }
 }
 
 // ------------------------------------------------------------------ App
@@ -592,7 +705,7 @@ fn minutes_picker(ui: &mut egui::Ui, v: &mut u32) {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let font_defs = Some(setup_style(&cc.egui_ctx));
-        let saved_settings = std::fs::read_to_string(games::data_path("settings.json")).unwrap_or_default();
+        let saved_settings = games::read_data("settings.json").unwrap_or_default();
         let s: Settings = serde_json::from_str(&saved_settings).unwrap_or_default();
         let loading_quests = if !s.discord_token.trim().is_empty() {
             Some(start_load_quests(s.discord_token.clone()))
@@ -635,6 +748,8 @@ impl App {
             s,
             cancel_quests: Arc::new(AtomicBool::new(false)),
             quests_running: Arc::new(AtomicBool::new(false)),
+            farm: Arc::default(),
+            stream: StreamCtl::new(),
             quests_fetched: loading_quests.is_some(),
             loading_quests,
             quests_error: None,
@@ -646,6 +761,7 @@ impl App {
             saved_settings,
             last_settings_check: Instant::now(),
             shot: Shot::from_env(),
+            trimmed: false,
         }
     }
 
@@ -838,9 +954,10 @@ impl App {
         self.tabs(&mut mid, running);
     }
 
-    fn tab_items(running: usize) -> [(Page, String); 4] {
+    fn tab_items(running: usize) -> [(Page, String); 5] {
         [
-            (Page::Games, "Ігри та демо".to_string()),
+            (Page::Games, "Ігри".to_string()),
+            (Page::Unique, "Фарм".to_string()),
             (Page::Quests, "Квести".to_string()),
             (Page::Active, format!("Активні · {running}")),
             (Page::Settings, "Налаштування".to_string()),
@@ -920,10 +1037,20 @@ impl App {
 
         let name: String = if g.name.chars().count() > 56 { g.name.chars().take(55).chain(['…']).collect() } else { g.name.clone() };
         let nr = text_c(p, pos2(rect.left() + 46.0 + h * 3.0, rect.center().y), Align2::LEFT_CENTER, name, FontId::proportional(15.0), Color32::WHITE);
+        let mut tag_x = nr.right() + 8.0;
         if g.demo {
-            let tag = Rect::from_min_size(pos2(nr.right() + 8.0, rect.center().y - 9.0), vec2(42.0, 18.0));
+            let tag = Rect::from_min_size(pos2(tag_x, rect.center().y - 9.0), vec2(42.0, 18.0));
             p.rect_filled(tag, 9.0, HOT.gamma_multiply(0.22));
             text_c(p, tag.center(), Align2::CENTER_CENTER, "DEMO", FontId::new(11.0, fam("display")), HOT);
+            tag_x = tag.right() + 6.0;
+        }
+        if g.rpc {
+            let tag = Rect::from_min_size(pos2(tag_x, rect.center().y - 9.0), vec2(34.0, 18.0));
+            p.rect_filled(tag, 9.0, ACCENT.gamma_multiply(0.22));
+            text_c(p, tag.center(), Align2::CENTER_CENTER, "RPC", FontId::new(11.0, fam("display")), ACCENT);
+        }
+        if g.rpc && resp.hovered() {
+            resp.on_hover_text("Гра без exe: запускається через Rich Presence, потрібен запущений Discord");
         }
 
         let right = pos2(rect.right() - 12.0, rect.center().y);
@@ -1000,13 +1127,13 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Час").font(FontId::new(15.0, fam("display"))).color(DIM));
-            minutes_picker(ui, &mut self.s.play_minutes);
+            time_input(ui, "play", &mut self.s.play_time, true, 1);
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let n = self.selected.len();
             if button(ui, &format!("▶   Запустити  ·  {n}"), Btn::Primary, n > 0).clicked() {
-                let dur = (self.s.play_minutes > 0).then(|| Duration::from_secs(self.s.play_minutes as u64 * 60));
+                let dur = self.s.play_time.secs().map(Duration::from_secs);
                 for &gi in &self.selected {
                     m.start(gi, dur);
                 }
@@ -1016,6 +1143,209 @@ impl App {
             if n > 0 && button(ui, "Зняти вибір", Btn::Ghost, true).clicked() {
                 self.selected.clear();
             }
+        });
+    }
+
+    fn farm_hold(&self) -> u64 {
+        self.s.farm_time.secs().unwrap_or(15).max(FARM_MIN_SECS)
+    }
+
+    fn farm_config(&self) -> FarmConfig {
+        FarmConfig {
+            target: self.s.farm_target.max(1),
+            batch: self.s.farm_batch.max(1),
+            hold_secs: self.farm_hold(),
+            only_demo: self.s.farm_only_demo,
+            skip_adult: self.s.farm_skip_adult,
+        }
+    }
+
+    /// Progress of the farm run: counter, time left, bar, current batch. Shared by
+    /// the "Unique" and "Active" tabs.
+    fn farm_progress(&self, ui: &mut egui::Ui) {
+        let running = self.farm.running.load(Ordering::Relaxed);
+        let (done, target) = (self.farm.done.load(Ordering::Relaxed), self.farm.target.load(Ordering::Relaxed));
+        let cfg = self.farm_config();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{done} / {target}")).font(FontId::monospace(15.0)).color(Color32::WHITE));
+            if running {
+                let batches = target.saturating_sub(done).div_ceil(cfg.batch) as f32;
+                ui.label(RichText::new(format!("· залишилось ≈ {}", fmt_secs((batches * cfg.batch_secs()) as u64))).size(12.5).color(DIM));
+                if let Some(s) = *self.farm.started.lock().unwrap_or_else(|e| e.into_inner()) {
+                    ui.label(RichText::new(format!("· минуло {}", fmt_clock(s.elapsed().as_secs()))).size(12.5).color(DIM));
+                }
+            }
+        });
+        flow_bar(ui, done as f32 / target.max(1) as f32, &self.tex, self.t, 6.0);
+        let b = self.farm.batch();
+        if running && !b.names.is_empty() {
+            let mut names = b.names.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+            if b.names.len() > 4 {
+                names += &format!(" +{}", b.names.len() - 4);
+            }
+            let left = b.ends.map_or(0, |e| e.saturating_duration_since(Instant::now()).as_secs());
+            ui.label(RichText::new(format!("Пачка {} · ще {left} с · {names}", b.number)).size(12.5).color(DIM));
+        }
+    }
+
+    fn page_farm(&mut self, ui: &mut egui::Ui, m: &mut Manager) {
+        egui::ScrollArea::vertical().id_salt("farm_page").auto_shrink([false, false]).show(ui, |ui| {
+            self.page_unique(ui, m);
+            ui.add_space(12.0);
+            self.stream_card(ui);
+        });
+    }
+
+    /// Stream status: both clients, watched time, stop button (used on "Farm" and "Active").
+    fn stream_status(&self, ui: &mut egui::Ui) {
+        let st = self.stream.status();
+        ui.horizontal(|ui| {
+            let watching = st.main == "watching";
+            pulse_dot(ui, if watching { GREEN } else { HOT }, self.t);
+            ui.label(RichText::new(fmt_clock(st.watched)).font(FontId::monospace(15.0)).color(Color32::WHITE));
+            let left = st.left.map_or("без обмеження".to_string(), |l| format!("залишилось {}", fmt_clock(l)));
+            ui.label(RichText::new(format!("· переглянуто · {left}")).size(12.5).color(DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if button(ui, "■ Стоп", Btn::Ghost, true).clicked() {
+                    self.stream.stop();
+                }
+            });
+        });
+        for (who, s) in [("Другий акаунт", &st.alt), ("Основний акаунт", &st.main)] {
+            ui.label(RichText::new(format!("{who}: {}", stream::describe(s))).size(12.5).color(DIM));
+        }
+    }
+
+    fn stream_card(&mut self, ui: &mut egui::Ui) {
+        let st = self.stream.status();
+        glass().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📺").font(FontId::new(22.0, fam("display"))));
+                ui.label(RichText::new("Перегляд трансляції").font(FontId::new(18.0, fam("display"))).color(Color32::WHITE));
+                ui.label(RichText::new(format!("· всього: {}", fmt_secs(st.total))).font(FontId::new(14.0, fam("display"))).color(GREEN));
+            });
+            for line in [
+                "Другий акаунт дзвонить основному в ЛС і транслює картинку з годинником, основний дивиться.",
+                "Усе робиться в одному прихованому браузері: ваш Discord не потрібен і не чіпається.",
+                "Рахується лише час, коли основний акаунт справді отримує відео трансляції.",
+            ] {
+                ui.label(RichText::new(line).size(12.5).color(DIM));
+            }
+            ui.add_space(12.0);
+            if st.running {
+                self.stream_status(ui);
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Токен 2-го акаунта").font(FontId::new(14.0, fam("display"))).color(Color32::WHITE));
+                let te = egui::TextEdit::singleline(&mut self.s.stream_token)
+                    .password(!self.show_token_in_settings)
+                    .desired_width(260.0)
+                    .margin(Margin::symmetric(10, 6))
+                    .hint_text("Токен акаунта, який транслює...");
+                ui.add(te);
+                let eye = if self.show_token_in_settings { "👁 Сховати" } else { "👁 Показати" };
+                if ui.button(eye).clicked() {
+                    self.show_token_in_settings = !self.show_token_in_settings;
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Час").font(FontId::new(14.0, fam("display"))).color(Color32::WHITE));
+                time_input(ui, "stream", &mut self.s.stream_time, true, 1);
+            });
+            ui.add_space(10.0);
+            let ready = !self.s.discord_token.trim().is_empty() && !self.s.stream_token.trim().is_empty();
+            if !ready {
+                ui.label(RichText::new("Потрібні обидва токени: основний (у Налаштуваннях) і другого акаунта.").size(12.5).color(HOT));
+                ui.add_space(6.0);
+            }
+            if button(ui, "▶   Почати перегляд", Btn::Primary, ready).clicked() {
+                match self.stream.start(self.s.stream_time.secs(), &self.s.discord_token, &self.s.stream_token) {
+                    Ok(()) => self.save_settings(true),
+                    Err(e) => self.status = e,
+                }
+            }
+        });
+    }
+    fn page_unique(&mut self, ui: &mut egui::Ui, m: &mut Manager) {
+        let hold = self.farm_hold();
+        let counted = m.played.values().filter(|&&s| farm::is_counted(s, hold)).count();
+        let running = self.farm.running.load(Ordering::Relaxed);
+        ui.add_space(8.0);
+        glass().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("🏆").font(FontId::new(22.0, fam("display"))));
+                ui.label(RichText::new("Унікальні ігри").font(FontId::new(18.0, fam("display"))).color(Color32::WHITE));
+                ui.label(
+                    RichText::new(format!("· зараховано: {counted} з {}", self.games.len()))
+                        .font(FontId::new(14.0, fam("display")))
+                        .color(GREEN),
+                );
+            });
+            ui.label(
+                RichText::new("Запускає пачками ігри, яких ще немає в статистиці. Значок Discord оновлюється із затримкою до доби.")
+                    .size(12.5)
+                    .color(DIM),
+            );
+
+            ui.add_space(14.0);
+            ui.add_enabled_ui(!running, |ui| {
+                egui::Grid::new("farm").num_columns(2).spacing([24.0, 12.0]).show(ui, |ui| {
+                    let lbl = |ui: &mut egui::Ui, s: &str| {
+                        ui.label(RichText::new(s).font(FontId::new(14.0, fam("display"))).color(Color32::WHITE));
+                    };
+                    lbl(ui, "Скільки ігор");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.s.farm_target).range(1..=20000).suffix(" шт."));
+                        for n in [100, 1000, 10000] {
+                            if ui.selectable_label(self.s.farm_target == n, n.to_string()).clicked() {
+                                self.s.farm_target = n;
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    lbl(ui, "Одночасно");
+                    ui.add(egui::Slider::new(&mut self.s.farm_batch, 1..=30));
+                    ui.end_row();
+                    lbl(ui, "Час на гру");
+                    ui.horizontal(|ui| {
+                        time_input(ui, "farm", &mut self.s.farm_time, false, FARM_MIN_SECS);
+                        ui.label(RichText::new("15 секунд достатньо").size(12.0).color(DIM));
+                    });
+                    ui.end_row();
+                    lbl(ui, "Фільтр");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.s.farm_only_demo, "Лише демо");
+                        ui.add_space(14.0);
+                        ui.checkbox(&mut self.s.farm_skip_adult, "Без 18+");
+                    });
+                    ui.end_row();
+                });
+            });
+
+            if running || self.farm.done.load(Ordering::Relaxed) > 0 {
+                ui.add_space(14.0);
+                self.farm_progress(ui);
+            } else {
+                let cfg = self.farm_config();
+                let total = cfg.target.div_ceil(cfg.batch) as f32 * cfg.batch_secs();
+                ui.add_space(10.0);
+                ui.label(RichText::new(format!("Орієнтовно: {}", fmt_secs(total as u64))).size(12.5).color(DIM));
+            }
+
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                let label = if running { "⏳   Фармиться…" } else { "▶   Запустити" };
+                if button(ui, label, Btn::Primary, !running && !self.games.is_empty()).clicked() {
+                    farm::start(self.farm_config(), self.mgr.clone(), self.farm.clone());
+                }
+                if running && button(ui, "■  Зупинити", Btn::Danger, true).clicked() {
+                    self.farm.cancel.store(true, Ordering::Relaxed);
+                }
+            });
         });
     }
 
@@ -1231,8 +1561,9 @@ impl App {
         // Quest games are shown on their quest cards, not in the process list.
         let has_runs = m.manual_runs().next().is_some();
         let has_tasks = !m.active_tasks.is_empty();
+        let has_farm = self.farm.running.load(Ordering::Relaxed) || self.stream.status().running;
 
-        if has_runs || has_tasks {
+        if has_runs || has_tasks || has_farm {
             ui.horizontal(|ui| {
                 if has_tasks && ui.button("Очистити список завдань").clicked() {
                     m.clear_completed_tasks();
@@ -1240,6 +1571,8 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if button(ui, "■  Зупинити всі", Btn::Danger, true).clicked() {
                         self.cancel_quests.store(true, Ordering::Relaxed);
+                        self.farm.cancel.store(true, Ordering::Relaxed);
+                        self.stream.stop();
                         m.stop_all();
                     }
                 });
@@ -1247,7 +1580,7 @@ impl App {
             ui.add_space(8.0);
         }
 
-        if !has_runs && !has_tasks {
+        if !has_runs && !has_tasks && !has_farm {
             ui.add_space(70.0);
             ui.vertical_centered(|ui| {
                 wave_text(ui, "тиша…", FontId::new(34.0, fam("title")), self.t);
@@ -1270,6 +1603,45 @@ impl App {
         let mut stop_run_idx = None;
 
         egui::ScrollArea::vertical().max_height(ui.available_height() - 130.0).show(ui, |ui| {
+            if self.stream.status().running {
+                ui.label(RichText::new("ТРАНСЛЯЦІЯ").font(FontId::new(12.0, fam("display"))).color(HOT));
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(10, 9, 24, 170))
+                    .stroke(Stroke::new(1.0f32, ACCENT.gamma_multiply(0.35)))
+                    .corner_radius(14)
+                    .inner_margin(Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("📺 Перегляд трансляції").font(FontId::new(16.0, fam("display"))).color(Color32::WHITE));
+                        self.stream_status(ui);
+                    });
+                ui.add_space(14.0);
+            }
+            if self.farm.running.load(Ordering::Relaxed) {
+                ui.label(RichText::new("ФАРМ УНІКАЛЬНИХ ІГОР").font(FontId::new(12.0, fam("display"))).color(HOT));
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(10, 9, 24, 170))
+                    .stroke(Stroke::new(1.0f32, ACCENT.gamma_multiply(0.35)))
+                    .corner_radius(14)
+                    .inner_margin(Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            pulse_dot(ui, GREEN, self.t);
+                            ui.label(RichText::new("🏆 Унікальні").font(FontId::new(16.0, fam("display"))).color(Color32::WHITE));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if button(ui, "■ Стоп", Btn::Ghost, true).clicked() {
+                                    self.farm.cancel.store(true, Ordering::Relaxed);
+                                }
+                            });
+                        });
+                        self.farm_progress(ui);
+                    });
+                ui.add_space(14.0);
+            }
+
             // 1. Quests Tasks Section (with percentage, reward details and animated bar)
             if has_tasks {
                 let count = |s: TaskState| m.active_tasks.iter().filter(|t| t.state == s).count();
@@ -1462,6 +1834,12 @@ impl eframe::App for App {
         let (focused, minimized, hover) =
             ctx.input(|i| (i.focused, i.viewport().minimized.unwrap_or(false), i.pointer.hover_pos()));
         let animate = self.s.animate && !minimized && (focused || !self.s.pause_unfocused);
+        // Just minimized: give the window's memory back to Windows (it comes back on demand).
+        if minimized && !self.trimmed {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+            unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+        }
+        self.trimmed = minimized;
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -1483,7 +1861,9 @@ impl eframe::App for App {
         let mut m = manager::lock(&mgr);
 
         // Quest games are part of their quest, so they aren't counted twice.
-        let running = m.manual_runs().count() + m.live_tasks();
+        let stream_on = self.stream.status().running;
+        let running =
+            m.manual_runs().count() + m.live_tasks() + self.farm.running.load(Ordering::Relaxed) as usize + stream_on as usize;
         let busy = running > 0 || self.loading.is_some();
 
         egui::CentralPanel::default()
@@ -1518,6 +1898,7 @@ impl eframe::App for App {
                             cu.add_space((1.0 - k) * 14.0);
                             match self.page {
                                 Page::Games => self.page_games(&mut cu, &mut m),
+                                Page::Unique => self.page_farm(&mut cu, &mut m),
                                 Page::Quests => self.page_quests(&mut cu, &mut m),
                                 Page::Active => self.page_active(&mut cu, &mut m),
                                 Page::Settings => self.page_settings(&mut cu, &mut m),
@@ -1543,12 +1924,22 @@ impl eframe::App for App {
 
         // Frame pacing: redraw only as often as needed.
         let intro = self.page_since.elapsed().as_secs_f32() < 2.8;
-        if animate {
-            ctx.request_repaint_after(Duration::from_secs_f32(1.0 / self.s.fps.max(1) as f32));
+        let period = if animate {
+            Some(Duration::from_secs_f32(1.0 / self.s.fps.clamp(1, 240) as f32))
         } else if !minimized && (intro || (mouse_moving && self.s.mouse_glow)) {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            Some(Duration::from_millis(33))
         } else if busy && !minimized {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            Some(Duration::from_millis(500))
+        } else {
+            None
+        };
+        if let Some(period) = period {
+            // egui subtracts its predicted frame time (~16 ms) from the delay, which turned
+            // "every 16 ms" into "right now" and made the app draw frames non-stop. Add it
+            // back, and count from the start of this frame, not from its end.
+            let predicted = ctx.input(|i| i.predicted_dt).clamp(0.0, 0.1);
+            let wait = period.saturating_sub(now.elapsed()) + Duration::from_secs_f32(predicted);
+            ctx.request_repaint_after(wait);
         }
     }
 
@@ -1557,6 +1948,8 @@ impl eframe::App for App {
             bg.lock().unwrap_or_else(|e| e.into_inner()).destroy(gl);
         }
         self.cancel_quests.store(true, Ordering::Relaxed);
+        self.farm.cancel.store(true, Ordering::Relaxed);
+        self.stream.stop_wait();
         manager::lock(&self.mgr).stop_all();
         self.save_settings(true);
     }

@@ -23,11 +23,11 @@ pub fn lock(m: &Mutex<Manager>) -> MutexGuard<'_, Manager> {
 }
 
 /// Job object: all child processes die with the program (even if it's killed).
-struct Job(windows_sys::Win32::Foundation::HANDLE);
+pub struct Job(windows_sys::Win32::Foundation::HANDLE);
 unsafe impl Send for Job {}
 
 impl Job {
-    fn new() -> Option<Self> {
+    pub fn new() -> Option<Self> {
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
             let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -45,7 +45,7 @@ impl Job {
             Some(Job(h))
         }
     }
-    fn add(&self, c: &Child) {
+    pub fn add(&self, c: &Child) {
         unsafe {
             windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(self.0, c.as_raw_handle() as _);
         }
@@ -114,13 +114,38 @@ pub struct QuestTask {
     pub started: Option<Instant>,
 }
 
+/// Who started a game.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// From the "Games" tab: listed on "Active".
+    Manual,
+    /// For quests: shown on their cards, closed when no quest needs it.
+    Quest,
+    /// By the unique-games farm: shown as one farm card, not logged one by one.
+    Farm,
+}
+
+/// How a running game shows up in Discord.
+enum Backend {
+    /// A dummy process at the game's exe path.
+    Process(Child),
+    /// Rich Presence for a game without an exe.
+    Rpc(crate::rpc::Session),
+}
+
+/// A launch made ready by [`prepare`] (the slow part, done without the manager lock).
+pub enum Prepared {
+    Exe(PathBuf),
+    Rpc(crate::rpc::Session),
+}
+
 pub struct Run {
     /// Game id, not an index: the game list can be reloaded while the game runs.
     pub id: String,
     pub name: String,
-    /// Started for quests (shown on their cards; closed when no quest needs it).
-    pub for_quest: bool,
-    child: Child,
+    pub exe_key: String,
+    pub origin: Origin,
+    backend: Backend,
     pub started: Instant,
     pub until: Option<Instant>,
     credited: u64,
@@ -132,17 +157,42 @@ pub struct LaunchInfo {
     pub id: String,
     pub name: String,
     pub exe: String,
+    pub args: Option<String>,
+    pub exe_key: String,
+    pub rpc: bool,
 }
 
 impl LaunchInfo {
     pub fn of(g: &Game) -> Self {
-        Self { id: g.id.clone(), name: g.name.clone(), exe: g.exe.clone() }
+        Self {
+            id: g.id.clone(),
+            name: g.name.clone(),
+            exe: g.exe.clone(),
+            args: g.args.clone(),
+            exe_key: g.exe_key.clone(),
+            rpc: g.rpc,
+        }
+    }
+}
+
+/// Deletes `games/<id>` (hard links, so no real data). Errors are ignored: a file of a
+/// process that is just exiting may still be locked, it'll be replaced next time.
+pub fn remove_game_dir(id: &str) {
+    let _ = fs::remove_dir_all(base_dir().join("games").join(id));
+}
+
+/// Gets a launch ready: the dummy exe on disk, or the Rich Presence connection.
+/// Slow-ish (disk, pipe), so call it without the manager lock when possible.
+pub fn prepare(g: &LaunchInfo) -> Result<Prepared, String> {
+    if g.rpc {
+        crate::rpc::Session::start(&g.id).map(Prepared::Rpc)
+    } else {
+        prepare_exe(g).map(Prepared::Exe)
     }
 }
 
 /// Prepares `games/<id>/<exe>`: a hard link to ourselves (0 bytes on disk), or a copy.
-/// Touches the disk, so call it without the manager lock when possible.
-pub fn prepare_exe(g: &LaunchInfo) -> Result<PathBuf, String> {
+fn prepare_exe(g: &LaunchInfo) -> Result<PathBuf, String> {
     let dest = base_dir().join("games").join(&g.id).join(&g.exe);
     let me = env::current_exe().map_err(|e| e.to_string())?;
     // An old version of the program may be sitting at the path — replace it.
@@ -183,8 +233,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn new() -> Self {
-        let played = fs::read_to_string(data_path("played.json"))
-            .ok()
+        let played = crate::games::read_data("played.json")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         Self {
@@ -227,36 +276,49 @@ impl Manager {
         if self.is_running_id(&info.id) {
             return true;
         }
-        let exe = prepare_exe(&info);
-        self.launch(info, exe, dur, false)
+        let prepared = prepare(&info);
+        self.launch(info, prepared, dur, Origin::Manual)
     }
 
-    /// Spawns an exe prepared by [`prepare_exe`] and registers the run.
-    pub fn launch(&mut self, info: LaunchInfo, exe: Result<PathBuf, String>, dur: Option<Duration>, for_quest: bool) -> bool {
+    /// Starts a launch made ready by [`prepare`] and registers the run.
+    pub fn launch(&mut self, info: LaunchInfo, prepared: Result<Prepared, String>, dur: Option<Duration>, origin: Origin) -> bool {
         if self.is_running_id(&info.id) {
             return true;
         }
-        let res = exe.and_then(|dest| {
-            Command::new(&dest)
-                .current_dir(dest.parent().unwrap_or(Path::new(".")))
-                .env(crate::DUMMY_ENV, "1")
-                .env(crate::TITLE_ENV, &info.name)
-                .creation_flags(CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
-                .spawn()
-                .map_err(|e| e.to_string())
+        let res = prepared.and_then(|p| match p {
+            Prepared::Rpc(s) => Ok(Backend::Rpc(s)),
+            Prepared::Exe(dest) => {
+                let mut cmd = Command::new(&dest);
+                if let Some(a) = &info.args {
+                    // Passed verbatim: Discord compares the command line as a string.
+                    cmd.raw_arg(a);
+                }
+                cmd.current_dir(dest.parent().unwrap_or(Path::new(".")))
+                    .env(crate::DUMMY_ENV, "1")
+                    .env(crate::TITLE_ENV, &info.name)
+                    .creation_flags(CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS)
+                    .spawn()
+                    .map_err(|e| e.to_string())
+                    .map(|child| {
+                        if let Some(j) = &self.job {
+                            j.add(&child);
+                        }
+                        Backend::Process(child)
+                    })
+            }
         });
         match res {
-            Ok(child) => {
-                if let Some(j) = &self.job {
-                    j.add(&child);
-                }
+            Ok(backend) => {
                 let now = Instant::now();
-                self.msg(format!("▶ {}", info.name));
+                if origin != Origin::Farm {
+                    self.msg(format!("▶ {}", info.name));
+                }
                 self.runs.push(Run {
                     id: info.id,
                     name: info.name,
-                    for_quest,
-                    child,
+                    exe_key: info.exe_key,
+                    origin,
+                    backend,
                     started: now,
                     until: dur.map(|d| now + d),
                     credited: 0,
@@ -287,10 +349,14 @@ impl Manager {
             return;
         }
         self.credit(i);
-        let mut r = self.runs.swap_remove(i);
-        let _ = r.child.kill();
-        let _ = r.child.wait();
-        self.msg(format!("■ {}", r.name));
+        let r = self.runs.swap_remove(i);
+        if let Backend::Process(mut child) = r.backend {
+            let _ = child.kill();
+            let _ = child.wait();
+        } // An Rpc session clears the presence when dropped.
+        if r.origin != Origin::Farm {
+            self.msg(format!("■ {}", r.name));
+        }
     }
 
     /// Stops the game with this id, if it is running.
@@ -327,7 +393,7 @@ impl Manager {
 
     /// Games started by hand (quest games are shown on their quest cards).
     pub fn manual_runs(&self) -> impl Iterator<Item = (usize, &Run)> {
-        self.runs.iter().enumerate().filter(|(_, r)| !r.for_quest)
+        self.runs.iter().enumerate().filter(|(_, r)| r.origin == Origin::Manual)
     }
 
     /// A quest task starts using a game (several quests may share one).
@@ -344,7 +410,7 @@ impl Manager {
         });
         if left == 0 {
             self.quest_games.remove(id);
-            if self.runs.iter().any(|r| r.id == id && r.for_quest) {
+            if self.runs.iter().any(|r| r.id == id && r.origin == Origin::Quest) {
                 self.stop_id(id);
             }
         }
@@ -383,7 +449,10 @@ impl Manager {
             self.credit(i);
             let r = &mut self.runs[i];
             let expired = r.until.is_some_and(|u| now >= u);
-            let dead = matches!(r.child.try_wait(), Ok(Some(_)));
+            let dead = match &mut r.backend {
+                Backend::Process(c) => matches!(c.try_wait(), Ok(Some(_))),
+                Backend::Rpc(s) => !s.alive(),
+            };
             if expired || dead {
                 self.stop(i);
             }

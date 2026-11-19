@@ -9,7 +9,7 @@
 
 use crate::games::Game;
 use crate::http;
-use crate::manager::{self, LaunchInfo, Manager, QuestTask, TaskKind, TaskState};
+use crate::manager::{self, LaunchInfo, Manager, Origin, QuestTask, TaskKind, TaskState};
 use serde::Deserialize;
 use serde_json::Value;
 use std::cell::Cell;
@@ -1254,9 +1254,9 @@ fn run_game_step(q: &DiscoveredQuest, card: &TaskCard, token: &str, mgr: &Mgr) {
     let _hold = GameHold { mgr, id: &game_id };
     if !already_running {
         card.set(0.0, format!("Запуск «{game_name}»…"));
-        let exe = manager::prepare_exe(&info); // disk work without the lock
+        let prepared = manager::prepare(&info); // disk / pipe work without the lock
         let dur = Duration::from_secs(limit + 30);
-        if !manager::lock(mgr).launch(info, exe, Some(dur), true) {
+        if !manager::lock(mgr).launch(info, prepared, Some(dur), Origin::Quest) {
             return card.fail(format!("Не вдалося запустити «{game_name}»"));
         }
     }
