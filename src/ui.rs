@@ -782,7 +782,7 @@ impl App {
         }
         self.last_settings_check = Instant::now();
         if let Ok(t) = serde_json::to_string_pretty(&self.s) {
-            if t != self.saved_settings && std::fs::write(games::data_path("settings.json"), &t).is_ok() {
+            if t != self.saved_settings && games::write_data("settings.json", &t).is_ok() {
                 self.saved_settings = t;
             }
         }
@@ -1171,7 +1171,8 @@ impl App {
             if running {
                 let batches = target.saturating_sub(done).div_ceil(cfg.batch) as f32;
                 ui.label(RichText::new(format!("· залишилось ≈ {}", fmt_secs((batches * cfg.batch_secs()) as u64))).size(12.5).color(DIM));
-                if let Some(s) = *self.farm.started.lock().unwrap_or_else(|e| e.into_inner()) {
+                let started = *self.farm.started.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(s) = started {
                     ui.label(RichText::new(format!("· минуло {}", fmt_clock(s.elapsed().as_secs()))).size(12.5).color(DIM));
                 }
             }

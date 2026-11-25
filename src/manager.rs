@@ -2,7 +2,7 @@
 //! Driven by a background thread that wakes once per second, so timers work even
 //! when the window is minimized and the UI isn't redrawing.
 
-use crate::games::{base_dir, data_path, Game};
+use crate::games::{base_dir, Game};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
@@ -465,7 +465,7 @@ impl Manager {
 
     pub fn save(&mut self) {
         if let Ok(s) = serde_json::to_string(&self.played) {
-            let _ = fs::write(data_path("played.json"), s);
+            let _ = crate::games::write_data("played.json", s);
         }
         self.dirty = false;
         self.last_save = Instant::now();

@@ -1,10 +1,10 @@
 #![windows_subsystem = "windows"]
-//! Discord Unlocker ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â makes Discord detect games so that unique games,
+//! Discord Unlocker: makes Discord detect games so that unique games,
 //! game hours and demo hours are counted.
 //!
 //! Discord detects games by the exe path of a process. For each game we create a
 //! hard link to ourselves at `games/<id>/<path from the Discord list>` and start it
-//! with an env var; that copy just sleeps (0% CPU, ~150 KB RAM, no window).
+//! with an env var; that copy just sleeps (0% CPU, ~150 KB RAM, invisible window).
 
 mod bg;
 mod farm;
@@ -21,8 +21,10 @@ mod web;
 pub const DUMMY_ENV: &str = "DU_DUMMY";
 pub const TITLE_ENV: &str = "DU_TITLE";
 
-/// Dummy "game": a minimized tool window. Discord only sees processes that own a
-/// window, while this one isn't shown on screen or on the taskbar.
+/// Dummy "game". Discord only sees processes that own a shown window, so it has one:
+/// borderless, far outside every monitor (-32000, -32000), and a tool window, so it's
+/// not on the taskbar or in Alt+Tab. Tested: Discord ignores layered (transparent)
+/// windows, while this one is detected.
 fn dummy() -> ! {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::*;
@@ -46,9 +48,9 @@ fn dummy() -> ! {
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            WS_POPUP,
+            -32000,
+            -32000,
             320,
             200,
             std::ptr::null_mut(),
@@ -56,7 +58,7 @@ fn dummy() -> ! {
             hinst,
             std::ptr::null(),
         );
-        ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
         // Message loop: blocks in GetMessage, 0% CPU.
         let mut msg: MSG = std::mem::zeroed();

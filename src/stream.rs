@@ -243,9 +243,14 @@ impl StreamCtl {
         let mut g = self.lock();
         let mut r = g.run.take()?;
         g.total += r.watched;
-        let _ = std::fs::write(data_path(FILE), serde_json::json!({ "total_secs": g.total }).to_string());
+        let total = g.total;
+        drop(g);
         let (child, stdin) = (r.child.take(), r.stdin.take());
-        Some(move || close(child, stdin))
+        Some(move || {
+            // Written outside the lock: the disk flush must not stall the UI.
+            let _ = crate::games::write_data(FILE, serde_json::json!({ "total_secs": total }).to_string());
+            close(child, stdin);
+        })
     }
 }
 

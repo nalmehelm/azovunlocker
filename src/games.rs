@@ -95,6 +95,22 @@ pub fn read_data(file: &str) -> Option<String> {
     })
 }
 
+/// Writes a data file next to the exe safely: into a temporary file that is flushed to
+/// disk first and then renamed over the old one. A crash or power loss mid-write leaves
+/// the old file intact instead of an empty or NUL-filled one.
+pub fn write_data(file: &str, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let path = data_path(file);
+    let tmp = data_path(&format!("{file}.tmp"));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut f, contents.as_ref())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
 /// Saves the list in Discord's own format, but only with the fields we use:
 /// ~1 MB instead of ~13 MB, so every next start parses it many times faster.
 fn save_cache(games: &[Game]) -> Result<(), String> {
@@ -118,7 +134,7 @@ fn save_cache(games: &[Game]) -> Result<(), String> {
         })
         .collect();
     let text = serde_json::to_string(&slim).map_err(|e| e.to_string())?;
-    fs::write(data_path(CACHE), text).map_err(|e| format!("не вдалося зберегти: {e}"))?;
+    write_data(CACHE, text).map_err(|e| format!("не вдалося зберегти: {e}"))?;
     for old in OLD_CACHES {
         let _ = fs::remove_file(data_path(old));
     }
